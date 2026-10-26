@@ -1,0 +1,16 @@
+# Spark output markers and temporary files (commit the part-...txt result, not these)
+shared-folder/output/**/_SUCCESS
+shared-folder/output/**/.*.crc
+shared-folder/output/**/_temporary/
+
+# Python
+__pycache__/
+
+# Operating system
+.DS_Store
+Thumbs.db
+
+# Generated input data (regenerate it with datagen.py and your seed)
+shared-folder/input/*.csv
+shared-folder/datagen.py
+shared-folder/output/clean_trips/
