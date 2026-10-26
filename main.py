@@ -13,7 +13,7 @@ import sys
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (col, count, sum as ssum, avg, round as sround, to_date,
-                                   desc, row_number)
+                                   desc, row_number, lit, coalesce, unix_timestamp)
 from pyspark.sql.types import (StructType, StructField, StringType, IntegerType, DoubleType,
                                TimestampType)
 from pyspark.sql.window import Window
@@ -70,8 +70,36 @@ def part1_clean(raw):
     DataFrame: rows_total, bad_time, bad_fare, removed, rows_kept.
     A row that breaks both rules counts in both bad_time and bad_fare, but once in removed.
     """
-    # TODO
-    return None, None
+    # Flag every row first instead of filtering straight away, so the bad rows can be counted.
+    # Rule 1: a null comparison (missing timestamp) also counts as bad, hence the coalesce.
+    # Rule 2: try_cast turns "", "N/A", "unknown" and "12,40" into null instead of failing.
+    flagged = (raw
+               .withColumn("fare_num", col("fare").try_cast(DoubleType()))
+               .withColumn("bad_time",
+                           ~coalesce(col("dropoff_ts") > col("pickup_ts"), lit(False)))
+               .withColumn("bad_fare", col("fare_num").isNull()))
+
+    is_bad = col("bad_time") | col("bad_fare")
+    counts = flagged.agg(
+        count(lit(1)).alias("rows_total"),
+        ssum(col("bad_time").cast("int")).alias("bad_time"),
+        ssum(col("bad_fare").cast("int")).alias("bad_fare"),
+        ssum(is_bad.cast("int")).alias("removed"),
+        ssum((~is_bad).cast("int")).alias("rows_kept"),
+    )
+
+    # Same columns and order as raw, with fare swapped for the numeric version.
+    clean = (flagged
+             .filter(~is_bad)
+             .select(*[col("fare_num").alias("fare") if c == "fare" else col(c)
+                       for c in raw.columns])
+             .withColumn("day", to_date(col("pickup_ts")))
+             .withColumn("duration_min",
+                         sround((unix_timestamp(col("dropoff_ts"))
+                                 - unix_timestamp(col("pickup_ts"))) / 60.0, 2)))
+
+    clean.write.mode("overwrite").parquet(f"{out_dir}/clean_trips")
+    return clean, counts
 
 
 # ---------------------------------------------------------------- Part 2a: zone revenue per day
@@ -81,8 +109,12 @@ def part2a_zone_revenue(clean, zones):
     Columns: day, zone_id, zone_name, trips, revenue (sum of fares, 2 decimals).
     One row per (day, zone) with at least one trip. Ordered by day, then zone_id.
     """
-    # TODO
-    return None
+    return (clean
+            .join(zones, clean.pickup_zone == zones.zone_id)
+            .groupBy("day", "zone_id", "zone_name")
+            .agg(count(lit(1)).alias("trips"),
+                 sround(ssum("fare"), 2).alias("revenue"))
+            .orderBy("day", "zone_id"))
 
 
 # ---------------------------------------------------------------- Part 2b: driver busiest day
@@ -93,8 +125,13 @@ def part2b_driver_busiest_day(clean):
     Ties: the earliest day. Hint: count per (driver, day), then row_number over a window
     partitioned by driver and ordered by trips descending, day ascending.
     """
-    # TODO
-    return None
+    per_day = clean.groupBy("driver_id", "day").agg(count(lit(1)).alias("trips"))
+    w = Window.partitionBy("driver_id").orderBy(desc("trips"), col("day").asc())
+    return (per_day
+            .withColumn("rn", row_number().over(w))
+            .filter(col("rn") == 1)
+            .select("driver_id", "day", "trips")
+            .orderBy("driver_id"))
 
 
 # ---------------------------------------------------------------- Part 3: Spark SQL
@@ -107,8 +144,18 @@ def part3_borough_sql(clean, zones):
     Then call .explain() on this result and on part 2a's result and compare the plans in
     your report.
     """
-    # TODO
-    return None
+    clean.createOrReplaceTempView("trips")
+    zones.createOrReplaceTempView("zones")
+    return spark.sql("""
+        SELECT z.borough,
+               COUNT(*)                     AS trips,
+               ROUND(SUM(t.fare), 2)        AS revenue,
+               ROUND(AVG(t.distance_km), 2) AS avg_distance_km
+        FROM trips t
+        JOIN zones z ON t.pickup_zone = z.zone_id
+        GROUP BY z.borough
+        ORDER BY revenue DESC
+    """)
 
 
 clean, counts = part1_clean(raw)
